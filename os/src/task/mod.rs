@@ -17,6 +17,7 @@ mod task;
 use crate::config::MAX_APP_NUM;
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
+use crate::syscall::TaskInfo;
 use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
@@ -53,11 +54,12 @@ lazy_static! {
         let num_app = get_num_app();
         let mut tasks = [TaskControlBlock {
             task_cx: TaskContext::zero_init(),
-            task_status: TaskStatus::UnInit,
+            // task_info.status: TaskStatus::UnInit,
+            task_info: TaskInfo::new_uninit(),
         }; MAX_APP_NUM];
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
-            task.task_status = TaskStatus::Ready;
+            task.task_info.status = TaskStatus::Ready;
         }
         TaskManager {
             num_app,
@@ -70,6 +72,53 @@ lazy_static! {
         }
     };
 }
+impl TaskManager {
+    /// Get task info of current task
+    pub fn get_task_info(&self) -> Result<TaskInfo, &'static str> {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+
+        Ok(inner.tasks[current].task_info.clone())
+    }
+
+    /// Update the task info of current task
+    pub fn update_task_info_syscall(&self, syscall_num: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current]
+            .task_info
+            .plus1_syscall_times(syscall_num);
+    }
+
+    /// Update the task info runtime
+    pub fn update_task_info_runtime(&self) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].task_info.update_get_runtime();
+    }
+
+    /// Show the task info of current task
+    pub fn show_task_info(&self) {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let info = inner.tasks[current].task_info;
+        debug!(
+        "---------------------------------------
+        task status: {:?}
+        syscall_times:\tSYSCALL_EXIT:{}\tSYSCALL_YIELD:{}\tSYSCALL_GET_TIME:{}\tSYSCALL_TASK_INFO:{}\tSYS_WRITE:{}
+        runtime: {}ms, first_run_time: {}ms
+        ---------------------------------------",
+            info.status,
+            info.syscall_times[crate::syscall::SYSCALL_EXIT],
+            info.syscall_times[crate::syscall::SYSCALL_YIELD],
+            info.syscall_times[crate::syscall::SYSCALL_GET_TIME],
+            info.syscall_times[crate::syscall::SYSCALL_TASK_INFO],
+            info.syscall_times[crate::syscall::SYSCALL_WRITE],
+            info.time,
+            info.first_run_time,
+        );
+    }
+}
 
 impl TaskManager {
     /// Run the first task in task list.
@@ -79,7 +128,7 @@ impl TaskManager {
     fn run_first_task(&self) -> ! {
         let mut inner = self.inner.exclusive_access();
         let task0 = &mut inner.tasks[0];
-        task0.task_status = TaskStatus::Running;
+        task0.task_info.status = TaskStatus::Running;
         let next_task_cx_ptr = &task0.task_cx as *const TaskContext;
         drop(inner);
         let mut _unused = TaskContext::zero_init();
@@ -94,14 +143,14 @@ impl TaskManager {
     fn mark_current_suspended(&self) {
         let mut inner = self.inner.exclusive_access();
         let current = inner.current_task;
-        inner.tasks[current].task_status = TaskStatus::Ready;
+        inner.tasks[current].task_info.status = TaskStatus::Ready;
     }
 
     /// Change the status of current `Running` task into `Exited`.
     fn mark_current_exited(&self) {
         let mut inner = self.inner.exclusive_access();
         let current = inner.current_task;
-        inner.tasks[current].task_status = TaskStatus::Exited;
+        inner.tasks[current].task_info.status = TaskStatus::Exited;
     }
 
     /// Find next task to run and return task id.
@@ -112,7 +161,7 @@ impl TaskManager {
         let current = inner.current_task;
         (current + 1..current + self.num_app + 1)
             .map(|id| id % self.num_app)
-            .find(|id| inner.tasks[*id].task_status == TaskStatus::Ready)
+            .find(|id| inner.tasks[*id].task_info.status == TaskStatus::Ready)
     }
 
     /// Switch current `Running` task to the task we have found,
@@ -121,7 +170,8 @@ impl TaskManager {
         if let Some(next) = self.find_next_task() {
             let mut inner = self.inner.exclusive_access();
             let current = inner.current_task;
-            inner.tasks[next].task_status = TaskStatus::Running;
+            inner.tasks[next].task_info.status = TaskStatus::Running;
+            inner.tasks[next].task_info.set_runtime();
             inner.current_task = next;
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
